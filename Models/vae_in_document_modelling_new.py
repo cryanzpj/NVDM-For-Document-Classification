@@ -6,15 +6,16 @@ import numpy as np
 import os,time, datetime
 import scipy.io as io
 from tensorflow.contrib import learn
+from scipy.sparse import vstack
 
 ###
-tf.flags.DEFINE_string("data_path",'.',"path for training data")
+tf.flags.DEFINE_string("data_path",'./data/data_train.npz',"path for training data")
 tf.flags.DEFINE_integer("vocab_size",10000,"Vocanulary size")
 tf.flags.DEFINE_integer("embedding_dim", 500, "Dimensionality of character embedding (default: 128)")
 tf.flags.DEFINE_integer("num_class", 103, "Number of class (default: 2)")
 tf.flags.DEFINE_float("l2_reg_lambda", 0.0, "L2 regularizaion lambda (default: 0.0)")
 tf.flags.DEFINE_float("train_size", 0.9, "training data size")
-tf.flags.DEFINE_float("learning_rate", 5e-2, "Learning Rate default: 5e-2 ")
+tf.flags.DEFINE_float("learning_rate", 5e-2/10000, "Learning Rate default: 5e-2 ")
 tf.flags.DEFINE_float("momentum", 0.9, "SGD Momentum ")
 tf.flags.DEFINE_float("drop_out", 0.5, "drop out keep rate ")
 
@@ -39,25 +40,21 @@ for attr, value in sorted(FLAGS.__flags.items()):
     print("{}={}".format(attr.upper(), value))
 print("")
 
+
 #data loding
 if os.path.isfile(FLAGS.data_path):
-    try: f = np.load(FLAGS.data_path)
-    except Exception as e1:
-        print(e1)
-    else:
-        try: data,label = f['data'],f['label']
-        except Exception as e2:
-            print(e2)
-
+    f = np.load(FLAGS.data_path)
+    data, label = f['data'],f['label']
+data = data.tolist()
+label = label.tolist()
 n_data = data.shape[0]
 
 Relu = tf.nn.relu
 
 #train/val split
 index = np.random.permutation(xrange(n_data))
-data_train,label_train = data[index[:int(n_data*FLAGS.train_size)]],label[index[:int(n_data*FLAGS.train_size)]]
+data_train,label_train = data[index[:int(n_data*FLAGS.train_size)].tolist()], label[index[:int(n_data*FLAGS.train_size)].tolist()]
 data_val,label_val = data[index[int(n_data*FLAGS.train_size):]],label[index[int(n_data*FLAGS.train_size):]]
-
 
 def Linear(x, out_shape, name="linear"):
     '''
@@ -95,7 +92,7 @@ def batch_iter(data, batch_size, num_epochs, shuffle=True):
 
 
 class nvdm():
-    def __init__(self,lr = 0.001,hs = 500,vocab_size = 10000,emb_size = 50,num_class = 103):
+    def __init__(self,lr = 0.001,hs = 500,vocab_size = 10000,emb_size = 50,num_class = 103, n_epoch = 10, N = 10000):
         '''hyperparameters'''
         self.epochs = n_epoch
         self.batch_size = 128
@@ -104,40 +101,40 @@ class nvdm():
         self.vocab_size = vocab_size
         self.num_class = num_class
         self.emb_size = emb_size # or 200 # latent dim
-        self.R = tf.Varibale(tf.truncated_normal([self.hidden, self.vocab_size],\
+        self.N = N #10000
+        self.R = tf.Variable(tf.truncated_normal([self.emb_size, self.vocab_size],\
                  stddev=0.002, name="r"))
         self.b_r = tf.Variable(tf.truncated_normal([self.vocab_size], \
                  stddev=0.002, name="br"))
-    #     self.model()
-    #
-    #     self.init = tf.initialize_all_variables()
-    #     self.sess = tf.Session()
-    #
-    # def model(self):
-    #
+        
         '''encode'''
-        self.input_x = tf.placeholder(tf.float32, [None, self.vocab_size],name = 'input_x') # 1*10000, 1doc
+        self.input_x = tf.placeholder(tf.float32, [None, self.vocab_size], name="input_x") # 1*10000, 1doc
         #self.input_y = tf.placeholder(tf.float32, [None, self.num_class], name="input_y")
 
         with tf.name_scope("encoding"):
 
             h1 = Relu(Linear(self.input_x, [self.hidden_size], name="h1"))
-            h2 = Relu(Linear(h1, [self.hidden_size], name="h2")) #1*hidden_Size
-            self.hmean = Linear(self.h2, [self.emb_size], name="hmean")
-            self.hlogvar = Linear(self.h2, [self.emb_size], name="hlogvar")
+            h2 = Relu(Linear(h1, [self.hidden_size], name="h2"))  #1*hidden_Size
+            self.hmean = Linear(h2, [self.emb_size], name="hmean")
+            self.hlogvar = Linear(h2, [self.emb_size], name="hlogvar") #1*emb_size = 50 # XXX
+
+            epsilon = tf.Variable(tf.random_normal([self.emb_size]))
+            z = self.hmean + tf.sqrt(tf.exp(self.hlogvar))*epsilon  # 1*emb_size
     
         '''decode'''
-        with tf.name_scope("encoding"):
+        with tf.name_scope("decoding"):  # FUCK FUCK FUCKING
             #self.x_i = tf.placeholder(tf.float32, [self.vocab_size, None]) #10000*N
+            #R:50*10000
+            x_i = tf.Variable(initial_value=np.identity(self.vocab_size), dtype='float32')
+            e = tf.matmul(tf.matmul(-z, self.R), x_i) + self.b_r #e:vocab_size*N
+            p_xi_h = tf.nn.log_softmax(e, dim=0) * self.input_x # vocab_size*N
 
-            e = tf.matmul(tf.matmul(-h2, self.R), self.input_x) + self.b_r #e:vocab_size*N
-            p_xi_h = tf.nn.logsoftmax(e, dim=0) # vocab_size*N
 
         with tf.name_scope('loss'):
             self.recon_loss = tf.reduce_sum(p_xi_h)
-            self.KL = -0.5 * tf.reduce_sum(1.0 +  self.hlogvar - tf.pow(self.hmean, 2) \
-                      - tf.exp(self.hlogvar), reduction_indices = 1)
-            self.loss = tf.reduce_mean(self.KL + self.reconstruct_loss)
+            self.KL = -0.5 * tf.reduce_sum(1.0 + self.hlogvar-tf.pow(self.hmean, 2) \
+                      - tf.exp(self.hlogvar), reduction_indices=1)
+            self.loss = tf.reduce_mean(0.0001 * self.KL + self.recon_loss)
 
 
 with tf.Graph().as_default():
@@ -189,13 +186,13 @@ with tf.Graph().as_default():
                   nvdm.input_x: x_batch,
                 }
 
-
             _, step, summaries, loss,  = sess.run(
-                [train_op, global_step, train_summary, nvdm.loss],
+                [train_op, global_step, loss_summary, nvdm.loss],
                 feed_dict)
             time_str = datetime.datetime.now().isoformat()
-            print("{}: epoch {}, step {}, loss {:g}, acc {:g}, global {:g}".format(time_str,epoch, step, loss))
-            train_summary_writer.add_summary(summaries, step)
+            print("time: {},  epoch: {}, step: {}, loss: {:g}".format(time_str,epoch, step, loss))
+            if step % 50 == 0:
+                train_summary_writer.add_summary(summaries, step)
 
         def dev_step(x_batch, y_batch, writer=None):
             """
@@ -216,12 +213,15 @@ with tf.Graph().as_default():
 
         # Generate batches
         batches = batch_iter(
-            list(zip(x_train, y_train)), FLAGS.batch_size, FLAGS.num_epochs)
-        num_batches_per_epoch = int(len(x_train)/FLAGS.batch_size) + 1
+            list(zip(data_train, label_train)), FLAGS.batch_size, FLAGS.num_epochs)
+        num_batches_per_epoch = int(label_train.shape[0]/FLAGS.batch_size) + 1
+
         current_step = 1
         # Training loop. For each batch...
         for batch in batches:
             x_batch, y_batch = zip(*batch)
+            x_batch = vstack(x_batch).toarray() #64 * 10000
+            y_batch = vstack(y_batch).toarray() #64 * 103
             train_step(x_batch, y_batch,1+ int(current_step//num_batches_per_epoch))
             current_step = tf.train.global_step(sess, global_step)
             if current_step % FLAGS.evaluate_every == 0:
